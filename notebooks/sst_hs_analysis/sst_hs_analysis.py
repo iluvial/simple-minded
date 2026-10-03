@@ -659,10 +659,11 @@ def mmm_field(daily, baseline=None):
     return clim, mmm, month
 
 
-def degree_heating_weeks(daily, mmm):
-    """HotSpot and DHW (degC-weeks) following NOAA Coral Reef Watch."""
+def degree_heating_weeks(daily, mmm, threshold=HOTSPOT_MIN):
+    """HotSpot and DHW (degC-weeks) following NOAA Coral Reef Watch.
+    `threshold` is the minimum HotSpot that accumulates (1 degC in CRW)."""
     hotspot = (daily - mmm).clip(min=0)                      # NaN stays NaN
-    qualifying = hotspot.where(hotspot >= HOTSPOT_MIN, 0.0).where(daily.notnull())
+    qualifying = hotspot.where(hotspot >= threshold, 0.0).where(daily.notnull())
     dhw = qualifying.rolling(time=DHW_WINDOW_DAYS, min_periods=DHW_WINDOW_DAYS).sum() / 7.0
     return hotspot, dhw
 
@@ -783,81 +784,177 @@ finish(fig, "A4c_dhw_regional_evolution.png", f"{SST_PLACE}; MMM baseline {base_
 # reached the MMM – the SST trace makes that difference visible.
 
 # %%
-s_sst, s_hs = cell_series(sst, site), cell_series(hotspot, site)
-s_dhw, s_mmm = cell_series(dhw, site), float(mmm.sel(latitude=site["lat"], longitude=site["lon"]))
+s_sst, s_mmm = cell_series(sst, site), float(mmm.sel(latitude=site["lat"], longitude=site["lon"]))
+s_dhw = cell_series(dhw, site)
+s_hs = (s_sst - s_mmm).clip(lower=0)
 
 DHW_C = "#b5495b"                                            # DHW line, as in A4c/A4e
+SST_C, THR_C = "#1d2b3a", "#8c2f33"
 LEVEL_FILLS = [(0, ALERT1, "#fde8c4", f"DHW < {ALERT1:g}: no alert (stress watch)"),
                (ALERT1, ALERT2, "#f4a261", f"Alert Level 1 ({ALERT1:g}–{ALERT2:g} °C-weeks): bleaching likely"),
                (ALERT2, np.inf, "#9b2226", f"Alert Level 2 (≥ {ALERT2:g} °C-weeks): widespread bleaching, mortality")]
 
-sel_all = s_sst.index.year.isin(DHW_YEARS)
-peak_sel = float(np.nanmax(s_dhw[sel_all])) if sel_all.any() else 0.0
-# DHW axis scaled so the curve fills the lower ~45 % of each panel and SST the upper part.
-dhw_top = max(ALERT2 * 1.25, peak_sel * 1.15) / 0.45
-sst_lo, sst_hi = float(s_sst[sel_all].min()), float(max(s_sst[sel_all].max(), s_mmm + HOTSPOT_MIN))
-sst_span = sst_hi - sst_lo
 
-fig, axes = plt.subplots(len(DHW_YEARS), 1, figsize=(14, 4.6 * len(DHW_YEARS)),
-                         layout="constrained", squeeze=False)
-for ax, y in zip(axes[:, 0], DHW_YEARS):
-    sel = s_sst.index.year == y
-    t, sy, hy, dy = s_sst.index[sel], s_sst[sel], s_hs[sel], s_dhw[sel].fillna(0)
+def alert_name(pk):
+    return "Alert Level 2" if pk >= ALERT2 else "Alert Level 1" if pk >= ALERT1 else "no alert"
 
-    # --- right axis: DHW, filled by alert level -----------------------------
+
+def dhw_axis_limits(sst_s, dhw_list, years, thr_max=HOTSPOT_MIN):
+    """Shared limits: DHW fills the lower ~45 % of a panel, SST the upper part."""
+    sel = sst_s.index.year.isin(years)
+    peak_all = max(float(np.nanmax(d[sel])) for d in dhw_list)
+    dhw_top = max(ALERT2 * 1.25, peak_all * 1.15) / 0.45
+    lo = float(sst_s[sel].min())
+    hi = float(max(sst_s[sel].max(), s_mmm + thr_max))
+    return dhw_top, (lo, hi)
+
+
+def dhw_panel(ax, year, sst_s, dhw_s, mmm_v, thr, dhw_top, sst_lims,
+              left_label=True, right_label=True):
+    """Daily SST (left axis) against MMM and MMM + thr, and the DHW it produces
+    (right axis) with the area under the curve coloured by alert level."""
+    sel = sst_s.index.year == year
+    t, sy, dy = sst_s.index[sel], sst_s[sel], dhw_s[sel].fillna(0)
+    hy = (sy - mmm_v).clip(lower=0)
+    counts = (hy >= thr) & (hy > 0)                          # days that add to the DHW
+
     ax2 = ax.twinx()
     ax.set_zorder(ax2.get_zorder() + 1)                      # SST drawn over the fills
     ax.patch.set_visible(False)
     for lo, hi, c, _ in LEVEL_FILLS:
         ax2.fill_between(t, lo, np.minimum(dy, hi), where=dy > lo, color=c,
                          alpha=0.85, lw=0, interpolate=True)
-    ax2.plot(t, dy, color=DHW_C, lw=2.4)
+    ax2.plot(t, dy, color=DHW_C, lw=2.2)
     for lvl, ls in [(ALERT1, (0, (2, 2))), (ALERT2, (0, (1, 1.5)))]:
-        ax2.axhline(lvl, color=DHW_C, lw=1.2, ls=ls, alpha=0.8)
+        ax2.axhline(lvl, color=DHW_C, lw=1.1, ls=ls, alpha=0.8)
     ax2.set_ylim(0, dhw_top)
-    ax2.set_yticks([v for v in (0, 2, 4, 6, 8, 12, 16, 20, 24) if v <= dhw_top * 0.5])
-    ax2.set_ylabel("DHW (°C-weeks)", color=DHW_C)
+    ax2.set_yticks([v for v in (0, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40) if v <= dhw_top * 0.5])
     ax2.tick_params(axis="y", colors=DHW_C)
-    ax2.yaxis.set_label_coords(1.045, 0.22)
     ax2.grid(False)
+    if right_label:
+        ax2.set_ylabel("DHW (°C-weeks)", color=DHW_C)
+        ax2.yaxis.set_label_coords(1.05, 0.22)
+    else:
+        ax2.set_yticklabels([])
 
-    # --- left axis: SST against MMM and MMM + 1 degC --------------------------
-    ax.plot(t, sy, color="#1d2b3a", lw=1.4)
-    ax.axhline(s_mmm, color=NEG, lw=1.6, ls="--")
-    ax.axhline(s_mmm + HOTSPOT_MIN, color="#8c2f33", lw=1.6, ls=":")
-    ax.fill_between(t, s_mmm + HOTSPOT_MIN, sy, where=hy >= HOTSPOT_MIN, color=POS,
-                    alpha=0.45, lw=0, interpolate=True)
-    ax.set_ylim(sst_lo - 0.95 * sst_span, sst_hi + 0.12 * sst_span)
+    lo, hi = sst_lims
+    span = hi - lo
+    ax.plot(t, sy, color=SST_C, lw=1.3)
+    ax.axhline(mmm_v, color=NEG, lw=1.5, ls="--")
+    if thr > 0:
+        ax.axhline(mmm_v + thr, color=THR_C, lw=1.5, ls=":")
+    ax.fill_between(t, mmm_v + thr, sy, where=counts, color=POS, alpha=0.45, lw=0,
+                    interpolate=True)
+    ax.set_ylim(lo - 0.95 * span, hi + 0.12 * span)
     # SST ticks (and their grid lines) only where SST is drawn, not over the DHW area
-    ax.set_yticks([v for v in ax.get_yticks() if sst_lo - 0.25 <= v <= sst_hi + 0.12 * sst_span])
-    ax.set_ylabel("SST (°C)")
-    ax.yaxis.set_label_coords(-0.045, 0.72)
-    ax.set_xlim(pd.Timestamp(y, 1, 1), pd.Timestamp(y, 12, 31))
+    ax.set_yticks([v for v in ax.get_yticks() if lo - 0.25 <= v <= hi + 0.12 * span])
+    if left_label:
+        ax.set_ylabel("SST (°C)")
+        ax.yaxis.set_label_coords(-0.05, 0.72)
+    ax.set_xlim(pd.Timestamp(year, 1, 1), pd.Timestamp(year, 12, 31))
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     ax.grid(axis="x", color="#e6e6e6")
 
     pk = float(dy.max())
-    level = ("Alert Level 2" if pk >= ALERT2 else "Alert Level 1" if pk >= ALERT1 else "no alert")
     if pk > 0:
         ax2.annotate(f"{pk:.1f} °C-weeks\n{dy.idxmax():%d %b}", (dy.idxmax(), pk),
                      xytext=(0, 8), textcoords="offset points", ha="center", va="bottom",
-                     fontsize=9, color=DHW_C, weight="bold")
-    ax.set_title(f"{y}  ·  peak DHW {pk:.1f} °C-weeks ({level})  ·  "
-                 f"{int((hy > 0).sum())} days above MMM, {int((hy >= HOTSPOT_MIN).sum())} with HotSpot ≥ 1 °C",
-                 loc="left", fontsize=11.5)
+                     fontsize=8.5, color=DHW_C, weight="bold")
+    return {"peak": pk, "date": dy.idxmax() if pk > 0 else None, "level": alert_name(pk),
+            "days_above_mmm": int((hy > 0).sum()), "days_counted": int(counts.sum())}
 
-handles = [Line2D([], [], color="#1d2b3a", lw=1.6, label="Daily mean SST"),
-           Line2D([], [], color=NEG, lw=1.6, ls="--", label=f"MMM = {s_mmm:.2f} °C"),
-           Line2D([], [], color="#8c2f33", lw=1.6, ls=":", label=f"MMM + {HOTSPOT_MIN:g} °C (accumulation threshold)"),
-           Patch(color=POS, alpha=0.45, label="HotSpot ≥ 1 °C (adds to DHW)"),
-           Line2D([], [], color=DHW_C, lw=2.4, label="DHW (right axis)")]
-handles += [Patch(color=c, alpha=0.85, label=lab) for *_, c, lab in LEVEL_FILLS]
-fig.suptitle(f"Thermal stress and Degree Heating Weeks \u2013 ERA5 SST, {site_txt}\n"
-             f"MMM baseline {base_txt}; DHW = 12-week sum of HotSpots \u2265 {HOTSPOT_MIN:g} \u00b0C / 7",
+
+def dhw_legend(fig, thr_label):
+    handles = [Line2D([], [], color=SST_C, lw=1.6, label="Daily mean SST"),
+               Line2D([], [], color=NEG, lw=1.5, ls="--", label=f"MMM = {s_mmm:.2f} °C"),
+               Line2D([], [], color=THR_C, lw=1.5, ls=":", label=thr_label),
+               Patch(color=POS, alpha=0.45, label="HotSpot that adds to the DHW"),
+               Line2D([], [], color=DHW_C, lw=2.2, label="DHW (right axis)")]
+    handles += [Patch(color=c, alpha=0.85, label=lab) for *_, c, lab in LEVEL_FILLS]
+    fig.legend(handles=handles, loc="outside lower center", ncol=3, fontsize=9, frameon=False)
+
+
+dhw_top, sst_lims = dhw_axis_limits(s_sst, [s_dhw], DHW_YEARS)
+fig, axes = plt.subplots(len(DHW_YEARS), 1, figsize=(14, 4.6 * len(DHW_YEARS)),
+                         layout="constrained", squeeze=False)
+for ax, y in zip(axes[:, 0], DHW_YEARS):
+    r = dhw_panel(ax, y, s_sst, s_dhw, s_mmm, HOTSPOT_MIN, dhw_top, sst_lims)
+    ax.set_title(f"{y}  ·  peak DHW {r['peak']:.1f} °C-weeks ({r['level']})  ·  "
+                 f"{r['days_above_mmm']} days above MMM, {r['days_counted']} with HotSpot ≥ 1 °C",
+                 loc="left", fontsize=11.5)
+fig.suptitle(f"Thermal stress and Degree Heating Weeks – ERA5 SST, {site_txt}\n"
+             f"MMM baseline {base_txt}; DHW = 12-week sum of HotSpots ≥ {HOTSPOT_MIN:g} °C / 7",
              weight="bold")
-fig.legend(handles=handles, loc="outside lower center", ncol=3, fontsize=9, frameon=False)
+dhw_legend(fig, f"MMM + {HOTSPOT_MIN:g} °C (accumulation threshold)")
 finish(fig, "A4d_dhw_site_detail.png")
+
+# %% [markdown]
+# **Sensitivity of the DHW to the HotSpot threshold.** The NOAA CRW definition only accumulates
+# HotSpots ≥ 1 °C, on the assumption that smaller anomalies do not cause visible stress. To see
+# how much that choice controls the result, the DHW is recomputed with three thresholds:
+#
+# | Scenario | HotSpots that accumulate | Role |
+# |---|---|---|
+# | ≥ 1 °C | SST ≥ MMM + 1 °C | NOAA CRW definition (the one used everywhere else in A4) |
+# | ≥ 0.5 °C | SST ≥ MMM + 0.5 °C | intermediate sensitivity test |
+# | > 0 | any SST above the MMM | upper bound: every warm-season excess counts |
+#
+# Rows are scenarios, columns are years; all panels share the same SST and DHW axes, so the
+# heights are directly comparable. Lowering the threshold can only add days, so the DHW grows
+# from top to bottom. Only the ≥ 1 °C row is comparable with the 4 / 8 °C-week alert levels,
+# which were calibrated against observed bleaching with that definition; the other two rows show
+# how sensitive the alert assessment is to the threshold, not alternative alert levels.
+
+# %%
+DHW_SCENARIOS = {"HotSpot ≥ 1 °C (NOAA CRW)": 1.0,
+                 "HotSpot ≥ 0.5 °C": 0.5,
+                 "HotSpot > 0 (any SST above the MMM)": 0.0}
+
+site_sst_da = sst.sel(latitude=site["lat"], longitude=site["lon"])
+site_mmm_da = mmm.sel(latitude=site["lat"], longitude=site["lon"])
+scen_site, scen_field = {}, {}
+for name, thr in DHW_SCENARIOS.items():
+    scen_site[name] = degree_heating_weeks(site_sst_da, site_mmm_da, thr)[1].to_series()
+    scen_field[name] = degree_heating_weeks(sst, mmm, thr)[1]
+
+dhw_top_s, sst_lims_s = dhw_axis_limits(s_sst, list(scen_site.values()), DHW_YEARS)
+fig, axes = plt.subplots(len(DHW_SCENARIOS), len(DHW_YEARS),
+                         figsize=(9 * len(DHW_YEARS), 4.1 * len(DHW_SCENARIOS)),
+                         layout="constrained", squeeze=False, sharex="col")
+rows = []
+for i, (name, thr) in enumerate(DHW_SCENARIOS.items()):
+    peak_f = scen_field[name].groupby("time.year").max("time")
+    for j, y in enumerate(DHW_YEARS):
+        ax = axes[i, j]
+        r = dhw_panel(ax, y, s_sst, scen_site[name], s_mmm, thr, dhw_top_s, sst_lims_s,
+                      left_label=(j == 0), right_label=(j == len(DHW_YEARS) - 1))
+        ax.set_title(f"{name}  ·  {y}\npeak {r['peak']:.1f} °C-weeks ({r['level']}), "
+                     f"{r['days_counted']} days accumulate", loc="left", fontsize=10.5)
+        pm = peak_f.sel(year=y)
+        rows.append({"scenario": name, "year": y, "threshold (°C)": thr,
+                     "site peak DHW": r["peak"],
+                     "site peak date": r["date"].date() if r["date"] is not None else None,
+                     "site alert": r["level"], "site days accumulating": r["days_counted"],
+                     "domain peak DHW": float(pm.max()),
+                     "% area DHW ≥ 4": float(area_fraction(pm >= ALERT1, sst_ocean)) * 100,
+                     "% area DHW ≥ 8": float(area_fraction(pm >= ALERT2, sst_ocean)) * 100})
+fig.suptitle(f"DHW under three HotSpot thresholds – ERA5 SST, {site_txt}\n"
+             f"MMM baseline {base_txt}; 12-week accumulation; shared axes in every panel",
+             weight="bold")
+dhw_legend(fig, "MMM + threshold (not drawn when the threshold is 0)")
+finish(fig, "A4f_dhw_threshold_scenarios.png")
+
+scen_table = pd.DataFrame(rows).set_index(["scenario", "year"])
+scen_table.round(2).to_csv(FIG_DIR / "A4f_dhw_threshold_scenarios.csv")
+for y in DHW_YEARS:
+    sub = scen_table.xs(y, level="year")
+    p = sub["site peak DHW"]
+    print(f"{y}: site peak DHW " + ", ".join(f"{v:.1f}" for v in p) + " °C-weeks for thresholds "
+          + ", ".join(f"{t:g}" for t in sub["threshold (°C)"]) + " °C; "
+          f"area ≥ 4: " + ", ".join(f"{v:.0f} %" for v in sub["% area DHW ≥ 4"])
+          + "; area ≥ 8: " + ", ".join(f"{v:.0f} %" for v in sub["% area DHW ≥ 8"]))
+scen_table.round(2)
 
 # %% [markdown]
 # **Record context.** Two years in isolation cannot say whether a value is unusual. Here every
